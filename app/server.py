@@ -1,17 +1,38 @@
 # app/server.py
 import mlflow
+import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import List
 
 # ---- Hard-coded config (simple, explicit) ----
 MLFLOW_TRACKING_URI = "http://127.0.0.1:5000"
-MODEL_NAME          = "iris-classifier"
-MODEL_VERSION       = "1"
+MODEL_NAME          = "iris_classifier"   # must match registered_model_name in your DAG
+DEFAULT_MODEL_VERSION = "1"               # starting version
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-MODEL_URI = f"models:/{MODEL_NAME}/{MODEL_VERSION}"
-model = mlflow.pyfunc.load_model(MODEL_URI)
+
+# Keep track of which version is currently served
+CURRENT_MODEL_VERSION = DEFAULT_MODEL_VERSION
+model = None  # will be loaded by helper
+
+
+def get_model_uri(version: str = None) -> str:
+    v = version or CURRENT_MODEL_VERSION
+    return f"models:/{MODEL_NAME}/{v}"
+
+
+def load_model(version: str):
+    """Load a specific model version from the MLflow Model Registry."""
+    global model, CURRENT_MODEL_VERSION
+    uri = get_model_uri(version)
+    model = mlflow.pyfunc.load_model(uri)
+    CURRENT_MODEL_VERSION = version
+
+
+# Load initial model at startup
+load_model(CURRENT_MODEL_VERSION)
+
 
 # ----- Pydantic schemas with helpful docs + examples -----
 class IrisSample(BaseModel):
@@ -19,6 +40,7 @@ class IrisSample(BaseModel):
     sepal_width:  float = Field(..., ge=0, description="Sepal width in cm")
     petal_length: float = Field(..., ge=0, description="Petal length in cm")
     petal_width:  float = Field(..., ge=0, description="Petal width in cm")
+
 
 class PredictRequest(BaseModel):
     samples: List[IrisSample]
@@ -37,8 +59,10 @@ class PredictRequest(BaseModel):
         }
     }
 
+
 # For convenience, return both class ids and human labels
 IRIS_LABELS = {0: "setosa", 1: "versicolor", 2: "virginica"}
+
 
 class PredictResponse(BaseModel):
     class_id: List[int]    # 0,1,2
@@ -52,15 +76,27 @@ class PredictResponse(BaseModel):
         }
     }
 
+
+class VersionRequest(BaseModel):
+    version: str = Field(..., description="MLflow model version to serve, e.g. '1', '2', '3'")
+
+
 app = FastAPI(
     title="Iris Classifier API",
     description="Predict Iris species from sepal/petal measurements (cm).",
     version="1.0.0",
 )
 
+
 @app.get("/health", tags=["health"])
 def health():
-    return {"status": "ok", "model_uri": MODEL_URI}
+    return {
+        "status": "ok",
+        "model_name": MODEL_NAME,
+        "version": CURRENT_MODEL_VERSION,
+        "model_uri": get_model_uri(),
+    }
+
 
 @app.post(
     "/predict",
@@ -70,12 +106,49 @@ def health():
     description="Send one or more Iris samples; returns class id (0,1,2) and label (setosa, versicolor, virginica)."
 )
 def predict(req: PredictRequest) -> PredictResponse:
-    # TODO Run predict
+    # Convert incoming samples to a numpy array of shape (n_samples, 4)
+    X = np.array([
+        [
+            s.sepal_length,
+            s.sepal_width,
+            s.petal_length,
+            s.petal_width,
+        ]
+        for s in req.samples
+    ])
+
+    preds = model.predict(X)
+    preds = [int(p) for p in preds]
+    labels = [IRIS_LABELS[p] for p in preds]
+
     return PredictResponse(
-        class_id=[],
-        class_label=[]
+        class_id=preds,
+        class_label=labels,
     )
-    
-# TODO Add endpoint to get the current model serving version
-# TODO Add endpoint to update the serving version
-# TODO Predict using the correct served version
+
+
+@app.get("/current_model_version", tags=["model"])
+def current_model_version():
+    """Show which model version is currently being served."""
+    return {
+        "model_name": MODEL_NAME,
+        "version": CURRENT_MODEL_VERSION,
+        "model_uri": get_model_uri(),
+    }
+
+
+@app.post("/set_model_version", tags=["model"])
+def set_model_version(req: VersionRequest):
+    """
+    Change which model version is served.
+    Example body:
+    {
+      "version": "2"
+    }
+    """
+    load_model(req.version)
+    return {
+        "status": "ok",
+        "message": f"Now serving {MODEL_NAME} version {CURRENT_MODEL_VERSION}",
+        "model_uri": get_model_uri(),
+    }
